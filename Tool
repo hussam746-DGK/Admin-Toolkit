@@ -1,0 +1,1560 @@
+<#
+    IT Administration Repair Toolkit - v4 (PowerShell engine)
+    Start it with IT_Toolkit.bat - the launcher handles admin rights.
+
+    Folder layout:
+      IT_Toolkit.bat   launcher (admin rights + execution policy)
+      IT_Toolkit.ps1   this file
+      Plugins\         your own .ps1 add-ons, shown under [P] Plugins
+      Logs\            logs, tickets, reports, fleet CSVs
+      targets.txt      optional list of computer names for the fleet tools
+#>
+
+# ============================ SETTINGS ============================
+$Script:Version       = '4.0'
+$Script:LogSecrets    = $true   # $true = BitLocker keys and Wi-Fi passwords also go into the full log. $false = screen only.
+$Script:LowDiskGB     = 20      # Free space below this shows in red
+$Script:LogKeepDays   = 30      # Toolkit logs older than this are deleted at startup
+$Script:ThrottleLimit = 32      # How many PCs the fleet tools talk to at once
+$Script:UpdateUrl     = ''      # Optional: URL of a text file holding the latest version number. Notify only, never auto-downloads.
+# ==================================================================
+
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Host 'Please start the toolkit with IT_Toolkit.bat - it asks for admin rights.' -ForegroundColor Red
+    Read-Host 'Press Enter to close'
+    exit 1
+}
+try { $Host.UI.RawUI.WindowTitle = "IT Administration Repair Toolkit v$($Script:Version)" } catch {}
+
+# ---------- Folders (falls back to ProgramData if the USB/folder is read-only) ----------
+$Script:Root   = $PSScriptRoot
+$Script:LogDir = Join-Path $Script:Root 'Logs'
+try {
+    if (-not (Test-Path $Script:LogDir)) { New-Item -ItemType Directory -Path $Script:LogDir -Force -ErrorAction Stop | Out-Null }
+    $probe = Join-Path $Script:LogDir '.write_test'
+    Set-Content -Path $probe -Value 'x' -ErrorAction Stop
+    Remove-Item $probe -Force
+} catch {
+    $Script:LogDir = Join-Path $env:ProgramData 'ITToolkit\Logs'
+    New-Item -ItemType Directory -Path $Script:LogDir -Force | Out-Null
+}
+$Script:TicketDir = Join-Path $Script:LogDir 'Tickets'
+$Script:FleetDir  = Join-Path $Script:LogDir 'Fleet'
+$Script:PluginDir = Join-Path $Script:Root 'Plugins'
+foreach ($d in $Script:TicketDir, $Script:FleetDir) { if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null } }
+if (-not (Test-Path $Script:PluginDir)) { try { New-Item -ItemType Directory -Path $Script:PluginDir -Force -ErrorAction Stop | Out-Null } catch {} }
+$Script:LogFile = Join-Path $Script:LogDir ("ToolkitLog_{0:yyyy-MM-dd}.txt" -f (Get-Date))
+
+# Delete this toolkit's own logs older than LogKeepDays
+Get-ChildItem -Path $Script:LogDir -Filter 'ToolkitLog_*.txt' -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$Script:LogKeepDays) } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+
+# ---------- State ----------
+$Script:Target         = $env:COMPUTERNAME
+$Script:IsLocal        = $true
+$Script:DryRun         = $false
+$Script:GraphConnected = $false
+$Script:CloudCache     = $null
+$Script:HeaderInfo     = $null
+$Script:UpdateNotice   = $null
+
+# ==================================================================
+#  OUTPUT + LOGGING HELPERS
+# ==================================================================
+function Say {
+    param([string]$Text, [ConsoleColor]$Color = 'Gray')
+    Write-Host $Text -ForegroundColor $Color
+}
+
+function Write-Log {
+    param([string]$Text)
+    try { Add-Content -Path $Script:LogFile -Value $Text -Encoding UTF8 -ErrorAction Stop } catch {}
+}
+
+function Write-LogHeader {
+    param([string]$Title)
+    Write-Log ''
+    Write-Log ("===== {0} | Target: {1} | {2:yyyy-MM-dd HH:mm:ss} =====" -f $Title, $Script:Target, (Get-Date))
+}
+
+function Out-Both {
+    # Shows pipeline output on screen AND writes it to the log
+    param([Parameter(ValueFromPipeline = $true)]$InputObject)
+    begin { $items = New-Object System.Collections.ArrayList }
+    process { [void]$items.Add($InputObject) }
+    end {
+        if ($items.Count -eq 0) { return }
+        $text = ($items | Out-String -Width 200).TrimEnd()
+        if ($text.Trim()) { Write-Host $text; Write-Log $text }
+    }
+}
+
+function Remove-RemoteInfo {
+    # Removes the PSComputerName/RunspaceId columns that remote results carry
+    param([Parameter(ValueFromPipeline = $true)]$InputObject)
+    process {
+        if ($null -eq $InputObject) { return }
+        if ($InputObject -is [string] -or $InputObject -is [ValueType]) { $InputObject; return }
+        if ($InputObject.PSObject.Properties['RunspaceId']) {
+            $InputObject | Select-Object -Property * -ExcludeProperty PSComputerName, RunspaceId, PSShowComputerName
+        } else { $InputObject }
+    }
+}
+
+function Head {
+    param([string]$Title)
+    Clear-Host
+    Say ('=== ' + $Title + ' ===') Cyan
+    if (-not $Script:IsLocal) { Say ('Target: ' + $Script:Target + ' (REMOTE)') Magenta }
+    if ($Script:DryRun) { Say 'DRY RUN is ON - changes are only described, not made.' Yellow }
+    Write-Host ''
+    Write-LogHeader $Title
+}
+
+function Show-SecretBanner {
+    Say '!!! SENSITIVE - anyone who sees this can unlock drives or join networks !!!' Red
+    if ($Script:LogSecrets) { Say 'These values are ALSO written to the log file (LogSecrets = $true).' DarkGray }
+    Write-Host ''
+}
+
+function Open-File {
+    # Opens through Explorer so browsers don't run with admin rights
+    param([string]$Path)
+    Start-Process -FilePath explorer.exe -ArgumentList ('"' + $Path + '"')
+}
+
+function Open-Logs { Start-Process -FilePath explorer.exe -ArgumentList ('"' + $Script:LogDir + '"') }
+
+# ==================================================================
+#  INPUT HELPERS - only valid keys do anything
+# ==================================================================
+function Read-YesNo {
+    # Y/N question with a safe default. TimeoutSec 0 = wait forever.
+    param([string]$Prompt, [ValidateSet('Y', 'N')][string]$Default = 'N', [int]$TimeoutSec = 15)
+    $hint = 'y/N'; if ($Default -eq 'Y') { $hint = 'Y/n' }
+    $auto = ''
+    if ($TimeoutSec -gt 0) {
+        $word = 'No'; if ($Default -eq 'Y') { $word = 'Yes' }
+        $auto = " (auto-$word in $TimeoutSec s)"
+    }
+    Write-Host ("{0} [{1}]{2}: " -f $Prompt, $hint, $auto) -ForegroundColor Yellow -NoNewline
+    while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) }   # ignore keys pressed earlier
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ($TimeoutSec -le 0 -or (Get-Date) -lt $deadline) {
+        if ([Console]::KeyAvailable) {
+            $c = [Console]::ReadKey($true).KeyChar.ToString().ToUpper()
+            if ($c -eq 'Y' -or $c -eq 'N') { Write-Host $c; return ($c -eq 'Y') }
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    Write-Host $Default
+    return ($Default -eq 'Y')
+}
+
+function Read-ValidKey {
+    param([string[]]$Keys)
+    while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) }
+    while ($true) {
+        $c = [Console]::ReadKey($true).KeyChar.ToString().ToUpper()
+        if ($Keys -contains $c) { return $c }
+    }
+}
+
+function Confirm-Exit { return (Read-YesNo 'Exit the toolkit?' 'N' 0) }
+
+function Exit-Toolkit {
+    if ($Script:GraphConnected) { try { Disconnect-MgGraph | Out-Null } catch {} }
+    Write-Log ("===== Toolkit closed {0:yyyy-MM-dd HH:mm:ss} =====" -f (Get-Date))
+    Say ("Logs saved in: " + $Script:LogDir) Cyan
+    Start-Sleep -Seconds 2
+    exit
+}
+
+function Show-Nav {
+    # Shown after every tool. Only B, M, L, Q work.
+    Write-Host ''
+    Say ('-' * 62) DarkCyan
+    Write-Host ' [B] Back    [M] Main Menu    [L] Open Logs    [Q] Exit' -ForegroundColor Yellow
+    Say ('-' * 62) DarkCyan
+    while ($true) {
+        $k = Read-ValidKey @('B', 'M', 'L', 'Q')
+        if ($k -eq 'B') { return 'B' }
+        if ($k -eq 'M') { return 'M' }
+        if ($k -eq 'L') { Open-Logs }
+        if ($k -eq 'Q') { if (Confirm-Exit) { Exit-Toolkit } }
+    }
+}
+
+# ==================================================================
+#  RUNNING THINGS ON THE TARGET (this PC or a remote PC)
+# ==================================================================
+function Invoke-OnTarget {
+    param([scriptblock]$ScriptBlock, [object[]]$ArgumentList = @())
+    if ($Script:IsLocal) { & $ScriptBlock @ArgumentList }
+    else { Invoke-Command -ComputerName $Script:Target -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList -ErrorAction Stop }
+}
+
+function Invoke-Change {
+    # Anything that CHANGES a PC goes through here, so Dry Run can stop it
+    param([string]$Description, [scriptblock]$ScriptBlock, [object[]]$ArgumentList = @())
+    if ($Script:DryRun) {
+        Say ("[DRY RUN] Would do on {0}: {1}" -f $Script:Target, $Description) Yellow
+        Write-Log ("[DRY RUN] " + $Description)
+        return
+    }
+    Write-Log ("ACTION: " + $Description)
+    Invoke-OnTarget -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList
+}
+
+function Invoke-NativeLive {
+    # Runs SFC/DISM-style tools. Local = live progress. Remote = waits, then shows results.
+    param([string]$Exe, [string]$Arguments, [switch]$Change, [switch]$HideRemoteOutput)
+    if ($Change -and $Script:DryRun) {
+        Say ("[DRY RUN] Would run on {0}: {1} {2}" -f $Script:Target, $Exe, $Arguments) Yellow
+        Write-Log ("[DRY RUN] $Exe $Arguments")
+        return $null
+    }
+    Write-Log ("RUN on {0}: {1} {2}" -f $Script:Target, $Exe, $Arguments)
+    if ($Script:IsLocal) {
+        $p = Start-Process -FilePath $Exe -ArgumentList $Arguments -NoNewWindow -Wait -PassThru
+        $code = $p.ExitCode
+    } else {
+        Say ("Running on {0}. Live progress isn't shown for remote PCs - please wait..." -f $Script:Target) DarkGray
+        $r = Invoke-Command -ComputerName $Script:Target -ErrorAction Stop -ArgumentList $Exe, $Arguments -ScriptBlock {
+            param($e, $a)
+            $out = & cmd.exe /c "$e $a" 2>&1
+            [pscustomobject]@{
+                Code = $LASTEXITCODE
+                Out  = @($out | ForEach-Object { "$_" } | Where-Object { $_.Trim() -and $_ -notmatch '\[=|^\s*\d+(\.\d+)?%' })
+            }
+        }
+        if (-not $HideRemoteOutput) { $r.Out | Out-Both }
+        $code = $r.Code
+    }
+    Write-Log ("Exit code: $code")
+    return $code
+}
+
+function Show-ExitStatus {
+    param($Code, [string]$LogHint)
+    if ($null -eq $Code) { return }
+    Write-Host ''
+    if ($Code -eq 0) { Say 'Done - exit code 0.' Green }
+    else { Say ("Done - exit code {0}. Review: {1}" -f $Code, $LogHint) Yellow }
+}
+
+function Show-Simple {
+    # Generic read-only tool: title + command, output shown and logged
+    param([string]$Title, [scriptblock]$ScriptBlock, [switch]$Table)
+    Head $Title
+    $r = Invoke-OnTarget -ScriptBlock $ScriptBlock | Remove-RemoteInfo
+    if ($Table) { $r | Format-Table -AutoSize -Wrap | Out-Both } else { $r | Out-Both }
+}
+
+function Invoke-RestorePointOffer {
+    # Returns $true = go ahead, $false = cancel
+    param([string]$Reason)
+    if ($Script:DryRun) { Say '[DRY RUN] Would offer a restore point.' Yellow; return $true }
+    Write-Host ''
+    if (-not (Read-YesNo 'Create a restore point first? Recommended' 'Y' 15)) { return $true }
+    Say 'Creating restore point, this can take a minute...' DarkGray
+    try {
+        Invoke-OnTarget -ArgumentList $Reason -ScriptBlock {
+            param($r)
+            Checkpoint-Computer -Description ("IT Toolkit - " + $r) -RestorePointType MODIFY_SETTINGS -ErrorAction Stop -WarningAction Stop
+        }
+        Say 'Restore point created.' Green
+        Write-Log ("Restore point created before: " + $Reason)
+        return $true
+    } catch {
+        Say ('Restore point was NOT created: ' + $_.Exception.Message) Yellow
+        Say 'Common causes: System Protection is off, or one was already made in the last 24 hours.' DarkGray
+        return (Read-YesNo 'Continue without a restore point?' 'N' 15)
+    }
+}
+
+function Restart-Target {
+    param([int]$DelaySec = 10)
+    $msg = 'IT support is restarting this PC. Please save your work.'
+    Invoke-Change ("Restart {0} in {1} seconds" -f $Script:Target, $DelaySec) -ArgumentList $DelaySec, $msg -ScriptBlock {
+        param($t, $m)
+        shutdown.exe /r /t $t /c $m
+    }
+}
+
+function Invoke-RestartOffer {
+    param([string]$Why)
+    Write-Host ''
+    Say $Why Yellow
+    if ($Script:DryRun) { Say '[DRY RUN] Would offer a restart.' Yellow; return }
+    if (Read-YesNo 'Restart now? Save work first' 'N' 30) {
+        if ($Script:IsLocal) { Restart-Target 10; Say 'Restarting in 10 seconds...' Red }
+        else { Restart-Target 60; Say ("Restart sent to {0}. The user gets a 60-second warning." -f $Script:Target) Green }
+    } else { Say 'OK. Restart later when convenient.' DarkGray }
+}
+
+function Get-RemoteErrorHint {
+    param([string]$Msg)
+    if ($Msg -match 'Access is denied|AccessDenied') { return 'Access denied - your account needs admin rights on that PC' }
+    if ($Msg -match 'cannot find the computer|could not be resolved|No such host|name is not valid|not resolve') { return 'Name not found - check spelling or DNS' }
+    if ($Msg -match 'Kerberos|TrustedHosts') { return 'Authentication problem - use the computer name (not IP) from a domain-joined PC' }
+    if ($Msg -match 'WinRM cannot complete the operation|cannot connect to the destination|The client cannot connect|timed out') { return 'Offline, blocked by firewall, or WinRM not enabled' }
+    if ($Msg.Length -gt 120) { return $Msg.Substring(0, 120) + '...' }
+    return $Msg
+}
+
+# ==================================================================
+#  SCRIPTBLOCKS THAT RUN ON THE TARGET (self-contained on purpose)
+# ==================================================================
+$Script:SB_Header = {
+    $os = Get-CimInstance Win32_OperatingSystem
+    $c  = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+    $pr = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+          (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
+    [pscustomobject]@{
+        OS            = $os.Caption
+        UptimeDays    = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 1)
+        FreeGB        = [math]::Round($c.FreeSpace / 1GB)
+        PendingReboot = [bool]$pr
+    }
+}
+
+$Script:SB_TicketData = {
+    $ErrorActionPreference = 'SilentlyContinue'
+    $os   = Get-CimInstance Win32_OperatingSystem
+    $cs   = Get-CimInstance Win32_ComputerSystem
+    $bios = Get-CimInstance Win32_BIOS
+    $c    = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+
+    $pend = @()
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $pend += 'CBS' }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $pend += 'WindowsUpdate' }
+    $pendText = 'No'; if ($pend.Count -gt 0) { $pendText = 'YES (' + ($pend -join ', ') + ')' }
+
+    $ds = dsregcmd.exe /status 2>$null
+    $entra = 'No'; if ($ds -match 'AzureAdJoined\s*:\s*YES') { $entra = 'Yes' }
+
+    $domain = 'Workgroup: ' + $cs.Workgroup; if ($cs.PartOfDomain) { $domain = $cs.Domain }
+
+    $bl = 'Unknown'
+    $blv = Get-BitLockerVolume -MountPoint 'C:'
+    if ($blv) { $bl = "$($blv.ProtectionStatus) ($($blv.VolumeStatus))" }
+
+    $lic = Get-CimInstance SoftwareLicensingProduct -Filter "PartialProductKey IS NOT NULL AND Name LIKE 'Windows%'" | Select-Object -First 1
+    $licText = 'Unknown'
+    switch ($lic.LicenseStatus) {
+        0 { $licText = 'Unlicensed' }
+        1 { $licText = 'Licensed' }
+        5 { $licText = 'Notification mode' }
+        { $_ -in 2, 3, 4, 6 } { $licText = 'Grace period' }
+    }
+
+    $def = 'Not available (third-party antivirus?)'
+    $mp = Get-MpComputerStatus
+    if ($mp) {
+        $sigAge = [int]((Get-Date) - $mp.AntivirusSignatureLastUpdated).TotalDays
+        $def = "Real-time: $($mp.RealTimeProtectionEnabled); signatures $sigAge days old"
+    }
+
+    $ip = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' } | Select-Object -First 1
+    $dns = ($ip.DNSServer | Where-Object { $_.AddressFamily -eq 2 } | ForEach-Object { $_.ServerAddresses }) -join ', '
+
+    $errs = Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1, 2; StartTime = (Get-Date).AddDays(-1) } -MaxEvents 5 |
+        ForEach-Object { '{0:MM-dd HH:mm} [{1}] {2}' -f $_.TimeCreated, $_.Id, (($_.Message -split "`r?`n")[0]).Trim() }
+
+    [pscustomobject]@{
+        Computer      = $env:COMPUTERNAME
+        LoggedOnUser  = $cs.UserName
+        Model         = "$($cs.Manufacturer) $($cs.Model)"
+        SerialNumber  = $bios.SerialNumber
+        OS            = "$($os.Caption) build $($os.BuildNumber)"
+        LastBoot      = $os.LastBootUpTime
+        UptimeDays    = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 1)
+        PendingReboot = $pendText
+        FreeGB_C      = [math]::Round($c.FreeSpace / 1GB)
+        TotalGB_C     = [math]::Round($c.Size / 1GB)
+        Domain        = $domain
+        EntraJoined   = $entra
+        IPv4          = ($ip.IPv4Address.IPAddress -join ', ')
+        Gateway       = ($ip.IPv4DefaultGateway.NextHop -join ', ')
+        DNS           = $dns
+        BitLocker_C   = $bl
+        Activation    = $licText
+        Defender      = $def
+        RecentErrors  = ($errs -join ' | ')
+    }
+}
+
+$Script:SB_NetTest = {
+    $res = @()
+    $gw = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1 -ExpandProperty NextHop
+    if ($gw) { $res += [pscustomobject]@{ Test = "1. Router ($gw)"; Pass = [bool](Test-Connection -ComputerName $gw -Count 2 -Quiet) } }
+    else { $res += [pscustomobject]@{ Test = '1. Router - no default gateway found'; Pass = $false } }
+    $res += [pscustomobject]@{ Test = '2. Internet by IP (1.1.1.1)'; Pass = [bool](Test-Connection -ComputerName 1.1.1.1 -Count 2 -Quiet) }
+    $dnsOk = $false
+    try { Resolve-DnsName www.microsoft.com -DnsOnly -ErrorAction Stop | Out-Null; $dnsOk = $true } catch {}
+    $res += [pscustomobject]@{ Test = '3. DNS lookup (www.microsoft.com)'; Pass = $dnsOk }
+    $ProgressPreference = 'SilentlyContinue'
+    $https = Test-NetConnection www.microsoft.com -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue
+    $res += [pscustomobject]@{ Test = '4. Secure web (HTTPS port 443)'; Pass = [bool]$https }
+    $res
+}
+
+$Script:SB_WUReset = {
+    # Microsoft's documented basic reset. Folders are renamed (not deleted) so it's reversible.
+    $log = @()
+    foreach ($s in 'bits', 'wuauserv', 'cryptsvc') { Stop-Service -Name $s -Force -ErrorAction SilentlyContinue; $log += "Stopped $s" }
+    Remove-Item "$env:ALLUSERSPROFILE\Microsoft\Network\Downloader\qmgr*.dat" -Force -ErrorAction SilentlyContinue
+    $log += 'Deleted BITS queue files (qmgr*.dat)'
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    foreach ($t in "$env:SystemRoot\SoftwareDistribution\DataStore", "$env:SystemRoot\SoftwareDistribution\Download", "$env:SystemRoot\System32\catroot2") {
+        if (Test-Path $t) {
+            try { Rename-Item -Path $t -NewName ((Split-Path $t -Leaf) + ".bak_$stamp") -ErrorAction Stop; $log += "Renamed $t" }
+            catch { $log += "FAILED to rename $t : $($_.Exception.Message)" }
+        }
+    }
+    foreach ($s in 'cryptsvc', 'bits', 'wuauserv') { Start-Service -Name $s -ErrorAction SilentlyContinue; $log += "Started $s" }
+    $log += "Old folders were kept as *.bak_$stamp - delete them once updates work again."
+    $log
+}
+
+$Script:SB_BitLockerKeys = {
+    $vols = Get-BitLockerVolume -ErrorAction SilentlyContinue
+    if (-not $vols) { return 'BitLocker info not available (Home edition, or BitLocker not installed).' }
+    foreach ($v in $vols) {
+        $rp = @($v.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' })
+        if ($rp.Count -eq 0) {
+            [pscustomobject]@{ Drive = $v.MountPoint; Protection = "$($v.ProtectionStatus)"; KeyID = '(none)'; RecoveryKey = 'No recovery password on this drive' }
+        }
+        foreach ($k in $rp) {
+            [pscustomobject]@{ Drive = $v.MountPoint; Protection = "$($v.ProtectionStatus)"; KeyID = $k.KeyProtectorId; RecoveryKey = $k.RecoveryPassword }
+        }
+    }
+}
+
+$Script:SB_WifiKeys = {
+    # Note: reads English-language netsh output
+    $profiles = netsh.exe wlan show profiles 2>$null | Select-String 'All User Profile\s*:\s*(.+)$' | ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() }
+    if (-not $profiles) { return 'No saved Wi-Fi profiles found (or the WLAN service is not running).' }
+    foreach ($p in $profiles) {
+        $detail = netsh.exe wlan show profile name="$p" key=clear 2>$null
+        $key  = $detail | Select-String 'Key Content\s*:\s*(.+)$' | ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() } | Select-Object -First 1
+        $auth = $detail | Select-String 'Authentication\s*:\s*(.+)$' | ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() } | Select-Object -First 1
+        $pw = '(none stored - open network or enterprise login)'; if ($key) { $pw = $key }
+        [pscustomobject]@{ Network = $p; Security = $auth; Password = $pw }
+    }
+}
+
+function Update-HeaderInfo {
+    try { $Script:HeaderInfo = Invoke-OnTarget -ScriptBlock $Script:SB_Header | Remove-RemoteInfo | Select-Object -First 1 }
+    catch { $Script:HeaderInfo = $null }
+}
+
+# ==================================================================
+#  DIAGNOSE
+# ==================================================================
+function Show-TicketSummary {
+    Head 'Ticket Summary'
+    Say 'Collecting, about 10-20 seconds...' DarkGray
+    $d = Invoke-OnTarget -ScriptBlock $Script:SB_TicketData | Remove-RemoteInfo | Select-Object -First 1
+    $body = ($d | Format-List | Out-String -Width 200).Trim()
+    $text = "TICKET SUMMARY - {0} - {1:yyyy-MM-dd HH:mm}`r`n{2}" -f $d.Computer, (Get-Date), $body
+    Write-Host $text
+    Write-Log $text
+    $file = Join-Path $Script:TicketDir ("TICKET_{0}_{1:yyyy-MM-dd_HHmm}.txt" -f $d.Computer, (Get-Date))
+    Set-Content -Path $file -Value $text -Encoding UTF8
+    Write-Host ''
+    try { Set-Clipboard -Value $text; Say 'Copied to clipboard - paste it into the ticket.' Green } catch { Say 'Could not copy to clipboard.' Yellow }
+    Say ("Saved: " + $file) DarkGray
+    $warn = @()
+    if ($d.UptimeDays -ge 14) { $warn += "Uptime is $($d.UptimeDays) days - a restart may fix it." }
+    if ("$($d.PendingReboot)" -like 'YES*') { $warn += 'A restart is pending.' }
+    if ($d.FreeGB_C -lt $Script:LowDiskGB) { $warn += "Low disk space: $($d.FreeGB_C) GB free." }
+    if ($d.Activation -ne 'Licensed') { $warn += "Activation: $($d.Activation)" }
+    if ($warn.Count -gt 0) {
+        Write-Host ''
+        Say 'Worth checking first:' Yellow
+        foreach ($w in $warn) { Say ('  - ' + $w) Yellow }
+    }
+}
+
+function Show-DriveHealth {
+    Head 'Drive Health'
+    Say 'Blank values are normal for some drives.' DarkGray
+    Invoke-OnTarget { Get-PhysicalDisk | Select-Object FriendlyName, MediaType, HealthStatus, OperationalStatus, @{ n = 'SizeGB'; e = { [math]::Round($_.Size / 1GB) } } } |
+        Remove-RemoteInfo | Format-Table -AutoSize | Out-Both
+    Invoke-OnTarget { Get-PhysicalDisk | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue | Select-Object DeviceId, Temperature, Wear, ReadErrorsUncorrected, PowerOnHours } |
+        Remove-RemoteInfo | Format-Table -AutoSize | Out-Both
+    Say 'File system check (read-only), may take a few minutes...' Cyan
+    Invoke-OnTarget { chkdsk.exe C: } | Out-Both
+}
+
+function Show-PendingReboot {
+    Head 'Pending Reboot Check'
+    $r = Invoke-OnTarget {
+        $pfro = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+        [pscustomobject]@{
+            ComponentServicing = [bool](Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')
+            WindowsUpdate      = [bool](Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
+            PendingFileRename  = [bool]$pfro
+        }
+    } | Remove-RemoteInfo | Select-Object -First 1
+    foreach ($p in 'ComponentServicing', 'WindowsUpdate', 'PendingFileRename') {
+        $v = [bool]$r.$p
+        Write-Host ('  {0,-20}' -f $p) -NoNewline
+        if ($v) { Write-Host 'PENDING' -ForegroundColor Red } else { Write-Host 'clear' -ForegroundColor Green }
+        Write-Log ("{0}: {1}" -f $p, $v)
+    }
+    Say 'Note: PendingFileRename is often set by antivirus or installers, so on its own it is a weak signal.' DarkGray
+    if ($r.ComponentServicing -or $r.WindowsUpdate) { Invoke-RestartOffer 'Windows is waiting for a restart.' }
+}
+
+function Show-EventErrors {
+    Head 'Last 20 System Errors'
+    Invoke-OnTarget {
+        Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1, 2 } -MaxEvents 20 -ErrorAction SilentlyContinue |
+            Select-Object TimeCreated, Id, ProviderName, @{ n = 'Message'; e = { ($_.Message -split "`r?`n")[0] } }
+    } | Remove-RemoteInfo | Format-Table -AutoSize -Wrap | Out-Both
+}
+
+function Show-ProblemDevices {
+    Head 'Problem Devices'
+    $d = @(Invoke-OnTarget { Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.Status -ne 'OK' } | Select-Object Status, Class, FriendlyName, InstanceId } | Remove-RemoteInfo)
+    if ($d.Count -eq 0) { Say 'No problem devices found.' Green; Write-Log 'No problem devices.' }
+    else { $d | Format-Table -AutoSize -Wrap | Out-Both }
+}
+
+function Show-Crashes {
+    Head 'Crash History (Blue Screens)'
+    $r = Invoke-OnTarget {
+        $dumps = @(Get-ChildItem "$env:SystemRoot\Minidump" -Filter *.dmp -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending |
+            Select-Object Name, LastWriteTime, @{ n = 'SizeKB'; e = { [math]::Round($_.Length / 1KB) } })
+        $bug = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 1001; ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting' } -MaxEvents 10 -ErrorAction SilentlyContinue |
+            Select-Object TimeCreated, @{ n = 'Detail'; e = { ($_.Message -split "`r?`n")[0] } })
+        [pscustomobject]@{ Dumps = $dumps; BugChecks = $bug }
+    } | Remove-RemoteInfo | Select-Object -First 1
+    if (@($r.Dumps).Count -gt 0) { Say 'Minidump files:' Cyan; $r.Dumps | Format-Table -AutoSize | Out-Both }
+    else { Say 'No minidump files found.' Green }
+    if (@($r.BugChecks).Count -gt 0) { Say 'Recent blue screen events:' Cyan; $r.BugChecks | Format-Table -AutoSize -Wrap | Out-Both }
+    else { Say 'No blue screen events found.' Green }
+    if ($Script:IsLocal) {
+        Write-Host ''
+        if (Read-YesNo 'Open Reliability Monitor too?' 'N' 15) { Start-Process perfmon.exe -ArgumentList '/rel' }
+    }
+}
+
+function Show-JoinStatus {
+    Head 'Domain / Entra Join Status'
+    Invoke-OnTarget { dsregcmd.exe /status } |
+        Where-Object { $_ -match 'AzureAdJoined|DomainJoined|EnterpriseJoined|WorkplaceJoined|DeviceName|TenantName|DomainName|MdmUrl|AzureAdPrt ' } |
+        ForEach-Object { $_.Trim() } | Out-Both
+}
+
+function Show-Win11Readiness {
+    Head 'Windows 11 Readiness (quick check)'
+    Invoke-OnTarget {
+        $tpm = Get-CimInstance -Namespace 'root\cimv2\security\microsofttpm' -ClassName Win32_Tpm -ErrorAction SilentlyContinue
+        $tpmText = 'Not found'; if ($tpm) { $tpmText = 'Present, version ' + (($tpm.SpecVersion -split ',')[0]) }
+        $sb = 'Not supported (legacy BIOS?)'
+        try { if (Confirm-SecureBootUEFI -ErrorAction Stop) { $sb = 'On' } else { $sb = 'Off (UEFI - can be turned on)' } } catch {}
+        [pscustomobject]@{
+            TPM            = $tpmText
+            SecureBoot     = $sb
+            CPU            = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
+            RAM_GB         = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+            SystemDrive_GB = [math]::Round((Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'").Size / 1GB)
+        }
+    } | Remove-RemoteInfo | Format-List | Out-Both
+    Say 'Needs: TPM 2.0, Secure Boot capable UEFI, 4 GB+ RAM, 64 GB+ storage, and a CPU on Microsoft''s supported list.' DarkGray
+}
+
+# ==================================================================
+#  REPAIR
+# ==================================================================
+function Invoke-QuickRepair {
+    Head 'Quick Repair - Check, then DISM, then SFC'
+    Say 'Step 0: health checks before repairing...' Cyan
+    $pre = Invoke-OnTarget {
+        [pscustomobject]@{
+            Disks   = @(Get-PhysicalDisk | Select-Object FriendlyName, HealthStatus)
+            Pending = [bool]((Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+                             (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'))
+        }
+    } | Remove-RemoteInfo | Select-Object -First 1
+    $bad = @($pre.Disks | Where-Object { "$($_.HealthStatus)" -ne 'Healthy' })
+    if ($bad.Count -gt 0) {
+        Say 'STOP: a drive reports it is NOT healthy:' Red
+        $bad | Format-Table -AutoSize | Out-Both
+        Say 'Back up the user''s data first. Repairs can stress a failing drive.' Red
+        if (-not (Read-YesNo 'Continue anyway?' 'N' 20)) { Say 'Cancelled. Nothing was changed.' Green; return }
+    } else { Say 'Drives report Healthy.' Green }
+    if ($pre.Pending) {
+        Say 'A restart is already pending. Restarting first often fixes the problem by itself.' Yellow
+        if (-not (Read-YesNo 'Continue without restarting?' 'N' 20)) { Invoke-RestartOffer 'Restart first, then run Quick Repair again if needed.'; return }
+    }
+    if (-not (Invoke-RestorePointOffer 'Quick Repair')) { Say 'Cancelled. Nothing was changed.' Green; return }
+    Write-Host ''
+    Say 'Step 1 of 2: DISM Restore Health (repairs the files SFC copies from)' Cyan
+    $c1 = Invoke-NativeLive 'DISM.exe' '/Online /Cleanup-Image /RestoreHealth' -Change
+    Show-ExitStatus $c1 'C:\Windows\Logs\DISM\dism.log on the target'
+    Write-Host ''
+    Say 'Step 2 of 2: SFC Scan' Cyan
+    $c2 = Invoke-NativeLive 'sfc.exe' '/scannow' -Change -HideRemoteOutput
+    Show-ExitStatus $c2 'C:\Windows\Logs\CBS\CBS.log on the target'
+    Invoke-RestartOffer 'A restart finishes any repairs SFC made.'
+}
+
+function Invoke-SfcScan {
+    Head 'SFC Scan - can take 10-20 minutes'
+    if (-not (Invoke-RestorePointOffer 'SFC Scan')) { Say 'Cancelled. Nothing was changed.' Green; return }
+    $c = Invoke-NativeLive 'sfc.exe' '/scannow' -Change -HideRemoteOutput
+    Show-ExitStatus $c 'C:\Windows\Logs\CBS\CBS.log on the target'
+}
+
+function Invoke-SfcVerify {
+    Head 'SFC Verify Only - can take 10-20 minutes'
+    $c = Invoke-NativeLive 'sfc.exe' '/verifyonly' -HideRemoteOutput
+    Show-ExitStatus $c 'C:\Windows\Logs\CBS\CBS.log on the target'
+}
+
+function Invoke-Dism {
+    param([string]$Mode)
+    $titles = @{ ScanHealth = 'DISM Scan Health'; RestoreHealth = 'DISM Restore Health'; StartComponentCleanup = 'Component Store Cleanup' }
+    Head $titles[$Mode]
+    $isChange = ($Mode -ne 'ScanHealth')
+    if ($Mode -eq 'RestoreHealth') {
+        if (-not (Invoke-RestorePointOffer 'DISM Restore Health')) { Say 'Cancelled. Nothing was changed.' Green; return }
+    }
+    if ($isChange) { $c = Invoke-NativeLive 'DISM.exe' "/Online /Cleanup-Image /$Mode" -Change }
+    else { $c = Invoke-NativeLive 'DISM.exe' "/Online /Cleanup-Image /$Mode" }
+    Show-ExitStatus $c 'C:\Windows\Logs\DISM\dism.log on the target'
+}
+
+function Reset-WindowsUpdate {
+    Head 'Windows Update Reset'
+    Say 'Stops update services, clears the download cache, and starts them again.' Gray
+    Say 'Folders are renamed, not deleted, so this can be undone.' DarkGray
+    Say 'Fixes: stuck downloads, updates that fail over and over, "pending" forever.' DarkGray
+    Write-Host ''
+    if (-not (Read-YesNo 'Reset Windows Update now?' 'N' 20)) { Say 'Cancelled. Nothing was changed.' Green; return }
+    Invoke-Change 'Windows Update component reset' $Script:SB_WUReset | Out-Both
+    Say 'Next: open Windows Update and click "Check for updates". A restart first can help.' Cyan
+}
+
+function Invoke-GPRefresh {
+    Head 'Group Policy Refresh'
+    Invoke-Change 'gpupdate /force' { cmd.exe /c 'echo N| gpupdate /force' } | Out-Both
+    if ($Script:IsLocal) {
+        $f = Join-Path $Script:LogDir ("gpresult_{0}_{1:yyyy-MM-dd_HHmm}.html" -f $env:COMPUTERNAME, (Get-Date))
+        gpresult.exe /h $f /f | Out-Null
+        if (Test-Path $f) {
+            Say ("Policy report saved: " + $f) Green
+            if (Read-YesNo 'Open it now?' 'Y' 10) { Open-File $f }
+        }
+    } else {
+        Say 'Computer policy summary from the target:' Cyan
+        Invoke-OnTarget { gpresult.exe /r /scope computer } | Out-Both
+    }
+}
+
+function Invoke-TimeResync {
+    Head 'Time Resync'
+    Say 'A wrong clock breaks sign-ins (Kerberos), Teams, and secure websites.' DarkGray
+    Invoke-Change 'Resync Windows time' { Start-Service w32time -ErrorAction SilentlyContinue; w32tm.exe /resync; ''; w32tm.exe /query /status } | Out-Both
+}
+
+function Invoke-DefenderScan {
+    param([ValidateSet('Quick', 'Full')][string]$Type)
+    Head ("Microsoft Defender - {0} Scan" -f $Type)
+    if ($Type -eq 'Full') {
+        Say 'A full scan can take an hour or more. The toolkit waits until it finishes.' Yellow
+        if (-not (Read-YesNo 'Start the full scan?' 'N' 15)) { Say 'Cancelled.' Green; return }
+    }
+    Say 'Updating signatures...' Cyan
+    Invoke-Change 'Update Defender signatures' {
+        try { Update-MpSignature -ErrorAction Stop; 'Signatures updated.' } catch { 'Signature update failed: ' + $_.Exception.Message }
+    } | Out-Both
+    Say ("Running {0} scan..." -f $Type) Cyan
+    Invoke-Change ("Defender {0} scan" -f $Type) -ArgumentList $Type -ScriptBlock {
+        param($t)
+        try { Start-MpScan -ScanType ($t + 'Scan') -ErrorAction Stop; 'Scan finished.' } catch { 'Scan failed: ' + $_.Exception.Message }
+        ''
+        'Detection history (most recent 10):'
+        Get-MpThreatDetection -ErrorAction SilentlyContinue | Sort-Object InitialDetectionTime -Descending | Select-Object -First 10 InitialDetectionTime, ThreatID, ActionSuccess, Resources
+    } | Remove-RemoteInfo | Out-Both
+    Say 'Review any threats in Windows Security > Protection history.' DarkGray
+}
+
+function Invoke-ChkdskSchedule {
+    Head 'Schedule CHKDSK Repair'
+    Say 'Schedules a full disk check and repair (chkdsk C: /f) at the next restart.' Gray
+    Say 'It can take an hour or more on big drives. Do NOT power off while it runs.' Yellow
+    if (-not (Read-YesNo 'Schedule it?' 'N' 20)) { Say 'Cancelled. Nothing was changed.' Green; return }
+    Invoke-Change 'Schedule chkdsk C: /f' { cmd.exe /c 'echo Y| chkdsk C: /f' } | Out-Both
+    Invoke-RestartOffer 'The check runs during the next restart.'
+}
+
+# ==================================================================
+#  NETWORK
+# ==================================================================
+function Invoke-NetTest {
+    Head 'Network Quick Test'
+    Say 'Testing, about 10-20 seconds...' DarkGray
+    Write-Host ''
+    $res = Invoke-OnTarget -ScriptBlock $Script:SB_NetTest | Remove-RemoteInfo
+    foreach ($r in $res) {
+        if ($r.Pass) { Write-Host '  [PASS] ' -ForegroundColor Green -NoNewline; Write-Log ('[PASS] ' + $r.Test) }
+        else { Write-Host '  [FAIL] ' -ForegroundColor Red -NoNewline; Write-Log ('[FAIL] ' + $r.Test) }
+        Write-Host $r.Test
+    }
+    Write-Host ''
+    Say 'How to read it: the first FAIL shows where the problem starts.' Gray
+    Say '  1 FAIL = local connection. Check cable, Wi-Fi, or router.' DarkGray
+    Say '  2 FAIL = router or internet provider.' DarkGray
+    Say '  3 FAIL only = DNS. Try Flush DNS.' DarkGray
+    Say '  Some networks block ping. If 3 and 4 PASS, the PC is online.' DarkGray
+}
+
+function Invoke-FlushDns {
+    Head 'Flush DNS'
+    Invoke-Change 'Flush DNS cache' { Clear-DnsClientCache; 'DNS cache cleared.' } | Out-Both
+}
+
+function Invoke-ProxyCheck {
+    Head 'System Proxy (WinHTTP)'
+    Invoke-OnTarget { netsh.exe winhttp show proxy } | Out-Both
+    Write-Host ''
+    if (Read-YesNo 'Reset the system proxy to "Direct access"?' 'N' 20) {
+        Invoke-Change 'netsh winhttp reset proxy' { netsh.exe winhttp reset proxy } | Out-Both
+    }
+    Say 'Note: browser/user proxy is separate: Settings > Network & internet > Proxy.' DarkGray
+}
+
+function Show-HostsFile {
+    Head 'Hosts File Check'
+    $h = @(Invoke-OnTarget { Get-Content "$env:SystemRoot\System32\drivers\etc\hosts" -ErrorAction Stop })
+    $active = @($h | Where-Object { $_ -and $_ -notmatch '^\s*#' })
+    $backup = Join-Path $Script:LogDir ("hosts_backup_{0}_{1:yyyyMMdd_HHmm}.txt" -f $Script:Target, (Get-Date))
+    $h | ForEach-Object { "$_" } | Set-Content -Path $backup
+    if ($active.Count -eq 0) { Say 'No active entries, only comments. That is the normal default.' Green }
+    else { Say ("{0} active entries - check any you don't recognize:" -f $active.Count) Yellow; $active | ForEach-Object { "$_" } | Out-Both }
+    Say ("Backup saved: " + $backup) DarkGray
+}
+
+function Reset-Winsock {
+    Head 'Reset Winsock'
+    Say 'Resets Windows network socket settings.' Gray
+    Say 'Can fix "connected but no internet" problems.' Gray
+    Say 'Some VPN or security apps may need reinstalling afterward.' Yellow
+    Write-Host ''
+    if (-not (Read-YesNo 'Reset Winsock now?' 'N' 15)) { Say 'Cancelled. Nothing was changed.' Green; return }
+    if (-not (Invoke-RestorePointOffer 'Winsock Reset')) { Say 'Cancelled. Nothing was changed.' Green; return }
+    Invoke-Change 'netsh winsock reset' { netsh.exe winsock reset } | Out-Both
+    Invoke-RestartOffer 'A restart is needed for this to take effect.'
+}
+
+function Reset-TcpIp {
+    Head 'Reset TCP/IP'
+    Say 'Resets TCP/IP settings to Windows defaults.' Gray
+    Say 'WARNING: this can erase static IP settings.' Red
+    if (-not $Script:IsLocal) { Say 'REMOTE WARNING: if this PC uses a static IP, you may lose contact with it after the restart.' Red }
+    Write-Host ''
+    if (-not (Read-YesNo 'Reset TCP/IP now?' 'N' 15)) { Say 'Cancelled. Nothing was changed.' Green; return }
+    $backup = Join-Path $Script:LogDir ("network-before-reset_{0}_{1:yyyyMMdd_HHmm}.txt" -f $Script:Target, (Get-Date))
+    Invoke-OnTarget { ipconfig.exe /all } | ForEach-Object { "$_" } | Set-Content -Path $backup
+    Say ("Current settings backed up to: " + $backup) Green
+    if (-not (Invoke-RestorePointOffer 'TCP-IP Reset')) { Say 'Cancelled. Nothing was changed.' Green; return }
+    Invoke-Change 'netsh int ip reset' { netsh.exe int ip reset } | Out-Both
+    Invoke-RestartOffer 'A restart is needed for this to take effect.'
+}
+
+function Show-WlanReport {
+    Head 'Wi-Fi Report'
+    netsh.exe wlan show wlanreport | Out-Both
+    $src = "$env:ProgramData\Microsoft\Windows\WlanReport\wlan-report-latest.html"
+    if (Test-Path $src) {
+        $dst = Join-Path $Script:LogDir ("wlan-report_{0}_{1:yyyy-MM-dd}.html" -f $env:COMPUTERNAME, (Get-Date))
+        Copy-Item $src $dst -Force
+        Say ("Saved: " + $dst) Green
+        if (Read-YesNo 'Open it now?' 'Y' 10) { Open-File $dst }
+    }
+}
+
+# ==================================================================
+#  PRINTING & APPS
+# ==================================================================
+function Reset-PrintSpooler {
+    Head 'Print Spooler Reset'
+    $jobs = Invoke-OnTarget { @(Get-Printer -ErrorAction SilentlyContinue | ForEach-Object { Get-PrintJob -PrinterName $_.Name -ErrorAction SilentlyContinue }).Count }
+    Say ("Print jobs currently queued: " + $jobs) Cyan
+    Say 'This stops the spooler, deletes ALL queued print jobs, and starts it again.' Yellow
+    if (-not (Read-YesNo 'Reset the print spooler now?' 'N' 20)) { Say 'Cancelled. Nothing was changed.' Green; return }
+    Invoke-Change 'Stop spooler, clear queue, start spooler' {
+        Stop-Service -Name Spooler -Force -ErrorAction Stop
+        Remove-Item "$env:SystemRoot\System32\spool\PRINTERS\*" -Force -Recurse -ErrorAction SilentlyContinue
+        Start-Service -Name Spooler -ErrorAction Stop
+        'Spooler restarted and queue cleared.'
+    } | Out-Both
+}
+
+function Show-Printers {
+    Head 'Printers and Queues'
+    Invoke-OnTarget {
+        Get-Printer -ErrorAction SilentlyContinue | ForEach-Object {
+            [pscustomobject]@{
+                Name   = $_.Name
+                Status = "$($_.PrinterStatus)"
+                Jobs   = @(Get-PrintJob -PrinterName $_.Name -ErrorAction SilentlyContinue).Count
+                Driver = $_.DriverName
+                Port   = $_.PortName
+            }
+        }
+    } | Remove-RemoteInfo | Format-Table -AutoSize | Out-Both
+}
+
+function Clear-TeamsCache {
+    Head 'Teams Cache Clear'
+    $profiles = @(Invoke-OnTarget {
+        Get-ChildItem "$env:SystemDrive\Users" -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notin 'Public', 'Default', 'Default User', 'All Users' } | ForEach-Object {
+                $new = Join-Path $_.FullName 'AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams'
+                $old = Join-Path $_.FullName 'AppData\Roaming\Microsoft\Teams'
+                if ((Test-Path $new) -or (Test-Path $old)) { [pscustomobject]@{ User = $_.Name; NewTeams = (Test-Path $new); ClassicTeams = (Test-Path $old) } }
+            }
+    } | Remove-RemoteInfo)
+    if ($profiles.Count -eq 0) { Say 'No Teams cache folders found.' Yellow; return }
+    $i = 0
+    foreach ($p in $profiles) { $i++; Write-Host ('  [{0}] ' -f $i) -ForegroundColor Yellow -NoNewline; Write-Host ('{0,-25} new Teams: {1,-6} classic: {2}' -f $p.User, $p.NewTeams, $p.ClassicTeams) }
+    $n = "$(Read-Host 'Which user? Number (Enter to cancel)')".Trim()
+    if (-not ($n -match '^\d+$' -and [int]$n -ge 1 -and [int]$n -le $profiles.Count)) { Say 'Cancelled.' Green; return }
+    $u = $profiles[[int]$n - 1].User
+    Say 'Teams will be closed for EVERY user on this PC, then the chosen user''s cache is cleared.' Yellow
+    Say 'Their Teams settings (like theme) reset. Chats and files are safe - they live in the cloud.' DarkGray
+    if (-not (Read-YesNo ("Clear Teams cache for {0}?" -f $u) 'N' 20)) { Say 'Cancelled. Nothing was changed.' Green; return }
+    Invoke-Change ("Clear Teams cache for " + $u) -ArgumentList $u -ScriptBlock {
+        param($user)
+        Get-Process -Name 'ms-teams', 'Teams' -ErrorAction SilentlyContinue | Stop-Process -Force
+        Start-Sleep -Seconds 2
+        $base = Join-Path "$env:SystemDrive\Users" $user
+        foreach ($p in (Join-Path $base 'AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams'), (Join-Path $base 'AppData\Roaming\Microsoft\Teams')) {
+            if (Test-Path $p) { Get-ChildItem $p -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue; "Cleared: $p" }
+        }
+        'Done. Teams can be opened again - the first start is slower.'
+    } | Out-Both
+}
+
+function Reset-Store {
+    Head 'Microsoft Store Reset'
+    Say 'Note: this resets the Store for the account running the toolkit.' DarkGray
+    Say 'If you elevated with a different admin account, run wsreset.exe as the user instead.' DarkGray
+    Invoke-Change 'Run wsreset.exe' { Start-Process wsreset.exe; 'Store reset started - the Store opens when it finishes.' } | Out-Both
+}
+
+function Repair-WinGet {
+    Head 'WinGet Repair'
+    Say 'Re-registers App Installer (winget) for the account running the toolkit.' DarkGray
+    Invoke-Change 'Re-register App Installer' {
+        try { Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop; 'App Installer re-registered. Test with: winget --version' }
+        catch { 'Failed: ' + $_.Exception.Message }
+    } | Out-Both
+}
+
+function Show-Panels {
+    Head 'Control Panels'
+    $panels = [ordered]@{
+        '1' = @('Network Connections', 'ncpa.cpl', $false)
+        '2' = @('Programs and Features', 'appwiz.cpl', $false)
+        '3' = @('Device Manager', 'devmgmt.msc', $false)
+        '4' = @('Computer Management', 'compmgmt.msc', $true)
+        '5' = @('Services', 'services.msc', $true)
+        '6' = @('Event Viewer', 'eventvwr.msc', $true)
+        '7' = @('System Properties', 'sysdm.cpl', $false)
+    }
+    foreach ($k in $panels.Keys) {
+        $label = $panels[$k][0]
+        if (-not $Script:IsLocal -and -not $panels[$k][2]) { $label += ' (local only)' }
+        Write-Host "  [$k] " -ForegroundColor Yellow -NoNewline; Write-Host $label
+    }
+    if (-not $Script:IsLocal) { Say ("Remote: Computer Management, Services and Event Viewer open connected to " + $Script:Target) DarkGray }
+    $n = "$(Read-Host 'Number to open (Enter to skip)')".Trim()
+    if (-not $panels.Contains($n)) { return }
+    $p = $panels[$n]
+    if ($Script:IsLocal) { Start-Process $p[1]; return }
+    if (-not $p[2]) { Say 'That panel only works on this PC.' Red; return }
+    switch ($p[1]) {
+        'compmgmt.msc' { Start-Process compmgmt.msc -ArgumentList ("/computer=\\" + $Script:Target) }
+        'services.msc' { Start-Process services.msc -ArgumentList ("/computer=" + $Script:Target) }
+        'eventvwr.msc' { Start-Process eventvwr.msc -ArgumentList $Script:Target }
+    }
+}
+
+function Start-QuickAssist {
+    Head 'Quick Assist'
+    try { Start-Process 'ms-quick-assist:' -ErrorAction Stop; Say 'Quick Assist opened.' Green }
+    catch { Say 'Could not open it automatically. Open "Quick Assist" from the Start menu.' Yellow }
+}
+
+# ==================================================================
+#  REPORTS & EXPORTS
+# ==================================================================
+function New-FullReport {
+    Head 'Full Report'
+    $withSfc = Read-YesNo 'Include SFC verify? Adds 10-20 minutes' 'N' 15
+    $file = Join-Path $Script:LogDir ("FullReport_{0}_{1:yyyy-MM-dd_HHmm}.txt" -f $Script:Target, (Get-Date))
+    $sections = [ordered]@{
+        'TICKET SUMMARY' = { Invoke-OnTarget -ScriptBlock $Script:SB_TicketData | Remove-RemoteInfo | Format-List }
+        'SYSTEM INFO'    = { Invoke-OnTarget { systeminfo.exe } }
+        'DISKS'          = { Invoke-OnTarget { Get-PhysicalDisk | Select-Object FriendlyName, MediaType, HealthStatus, OperationalStatus } | Remove-RemoteInfo | Format-Table -AutoSize }
+        'DISM CHECK'     = { Invoke-OnTarget { DISM.exe /Online /Cleanup-Image /CheckHealth } }
+        'NETWORK'        = { Invoke-OnTarget { ipconfig.exe /all } }
+        'WINRE'          = { Invoke-OnTarget { reagentc.exe /info } }
+        'RECENT ERRORS'  = { Invoke-OnTarget { Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1, 2 } -MaxEvents 20 -ErrorAction SilentlyContinue | Select-Object TimeCreated, Id, ProviderName } | Remove-RemoteInfo | Format-Table -AutoSize }
+    }
+    foreach ($name in $sections.Keys) {
+        Say ("  - " + $name) Gray
+        $text = ''
+        try { $text = (& $sections[$name] | Out-String -Width 200).Trim() } catch { $text = 'ERROR: ' + $_.Exception.Message }
+        Add-Content -Path $file -Value ("===== {0} =====`r`n{1}`r`n" -f $name, $text) -Encoding UTF8
+    }
+    if ($withSfc) {
+        Say '  - SFC VERIFY (the slow one)' Gray
+        $code = Invoke-OnTarget { sfc.exe /verifyonly | Out-Null; $LASTEXITCODE }
+        Add-Content -Path $file -Value ("===== SFC VERIFY =====`r`nExit code: {0}. Details: C:\Windows\Logs\CBS\CBS.log on the target.`r`n" -f $code) -Encoding UTF8
+    }
+    Write-Log ("Full report saved: " + $file)
+    Write-Host ''
+    Say ("Full report saved to: " + $file) Green
+}
+
+function Export-Software {
+    Head 'Installed Software Export'
+    $apps = @(Invoke-OnTarget {
+        Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -and -not $_.SystemComponent } |
+            Select-Object DisplayName, DisplayVersion, Publisher, InstallDate | Sort-Object DisplayName -Unique
+    } | Remove-RemoteInfo)
+    $file = Join-Path $Script:LogDir ("Software_{0}_{1:yyyy-MM-dd}.csv" -f $Script:Target, (Get-Date))
+    $apps | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
+    Say ("{0} programs exported to: {1}" -f $apps.Count, $file) Green
+    Write-Log ("Software export: " + $file)
+}
+
+function Export-Drivers {
+    Head 'Driver Export'
+    $drv = @(Invoke-OnTarget {
+        Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceName } |
+            Select-Object DeviceName, DriverVersion, DriverDate, Manufacturer, InfName | Sort-Object DeviceName
+    } | Remove-RemoteInfo)
+    $file = Join-Path $Script:LogDir ("Drivers_{0}_{1:yyyy-MM-dd}.csv" -f $Script:Target, (Get-Date))
+    $drv | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
+    Say ("{0} drivers exported to: {1}" -f $drv.Count, $file) Green
+    Write-Log ("Driver export: " + $file)
+}
+
+function New-PowerReport {
+    param([ValidateSet('battery', 'energy')][string]$Kind)
+    Head ("{0} Report" -f $Kind.ToUpper())
+    if ($Kind -eq 'energy') { Say 'This takes about 60 seconds...' DarkGray }
+    $html = Invoke-OnTarget -ArgumentList $Kind -ScriptBlock {
+        param($k)
+        $tmp = Join-Path $env:TEMP ("tk_{0}-report.html" -f $k)
+        if ($k -eq 'battery') { powercfg.exe /batteryreport /output $tmp | Out-Null } else { powercfg.exe /energy /output $tmp | Out-Null }
+        if (Test-Path $tmp) { Get-Content -Path $tmp -Raw; Remove-Item $tmp -Force }
+    }
+    if (-not $html) { Say 'No report was created. (A battery report needs a battery.)' Yellow; return }
+    $file = Join-Path $Script:LogDir ("{0}-report_{1}_{2:yyyy-MM-dd}.html" -f $Kind, $Script:Target, (Get-Date))
+    Set-Content -Path $file -Value "$html" -Encoding UTF8
+    Say ("Saved to: " + $file) Green
+    if (Read-YesNo 'Open it now?' 'Y' 10) { Open-File $file }
+}
+
+# ==================================================================
+#  POWER & BOOT
+# ==================================================================
+function Restart-TargetPC {
+    Head 'Restart PC'
+    if ($Script:IsLocal) { Say 'This restarts THIS PC in 10 seconds.' Red }
+    else { Say ("This restarts {0}. The user gets a 60-second warning." -f $Script:Target) Red }
+    if (-not (Read-YesNo 'Restart now?' 'N' 15)) { Say 'Cancelled. Nothing was changed.' Green; return }
+    if ($Script:IsLocal) { Restart-Target 10 } else { Restart-Target 60 }
+    Say 'Restart command sent.' Green
+}
+
+function Start-AdvancedStartup {
+    Head 'Advanced Startup'
+    Say 'This restarts the PC right away into Advanced Startup.' Red
+    Say 'Save your work first. Open apps will be force-closed.' Red
+    if (-not (Read-YesNo 'Restart now?' 'N' 15)) { Say 'Cancelled. Nothing was changed.' Green; return }
+    Invoke-Change 'Restart into Advanced Startup' { shutdown.exe /r /o /f /t 0 }
+}
+
+function Start-LocalTool {
+    param([string]$Title, [string]$Exe, [string]$Arguments = '', [string]$Note = '')
+    Head $Title
+    if ($Note) { Say $Note DarkGray }
+    if ($Arguments) { Start-Process $Exe -ArgumentList $Arguments } else { Start-Process $Exe }
+    Say ("Opened: " + $Title) Green
+    Write-Log ("Opened " + $Exe)
+}
+
+# ==================================================================
+#  SECRETS (visible by request)
+# ==================================================================
+function Show-BitLockerKeys {
+    Head 'BitLocker Recovery Keys'
+    Show-SecretBanner
+    $r = Invoke-OnTarget -ScriptBlock $Script:SB_BitLockerKeys | Remove-RemoteInfo
+    $text = ($r | Format-List | Out-String -Width 200).Trim()
+    Write-Host $text -ForegroundColor White
+    if ($Script:LogSecrets) { Write-Log $text } else { Write-Log '(BitLocker keys shown on screen, not logged.)' }
+}
+
+function Show-WifiPasswords {
+    Head 'Saved Wi-Fi Passwords'
+    Show-SecretBanner
+    $r = Invoke-OnTarget -ScriptBlock $Script:SB_WifiKeys | Remove-RemoteInfo
+    $text = ($r | Format-Table -AutoSize | Out-String -Width 200).Trim()
+    Write-Host $text -ForegroundColor White
+    if ($Script:LogSecrets) { Write-Log $text } else { Write-Log '(Wi-Fi passwords shown on screen, not logged.)' }
+    Say 'Note: this reads English-language Windows output.' DarkGray
+}
+
+# ==================================================================
+#  REMOTE & FLEET (Active Directory + WinRM)
+# ==================================================================
+function Set-Target {
+    param([string]$Name)
+    $Name = "$Name".Trim()
+    if (-not $Name -or $Name -eq $env:COMPUTERNAME -or $Name -eq 'localhost' -or $Name -eq '.') {
+        $Script:Target = $env:COMPUTERNAME; $Script:IsLocal = $true
+        Say 'Target set to THIS PC.' Green
+        Write-Log 'Target changed to this PC'
+        Update-HeaderInfo
+        return
+    }
+    Say ("Testing remote connection to {0} ..." -f $Name) DarkGray
+    try {
+        Test-WSMan -ComputerName $Name -ErrorAction Stop | Out-Null
+        Invoke-Command -ComputerName $Name -ScriptBlock { $env:COMPUTERNAME } -ErrorAction Stop | Out-Null
+        $Script:Target = $Name; $Script:IsLocal = $false
+        Say ("Connected. Target is now {0}." -f $Name) Green
+        Write-Log ("Target changed to " + $Name)
+        Update-HeaderInfo
+    } catch {
+        Say ("Can't manage {0} remotely: {1}" -f $Name, (Get-RemoteErrorHint $_.Exception.Message)) Red
+        Say 'See Remote & Fleet > Remoting Setup Help.' DarkGray
+    }
+}
+
+function Get-DomainComputers {
+    try {
+        $s = New-Object System.DirectoryServices.DirectorySearcher
+        $s.Filter = '(&(objectCategory=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'   # enabled computers only
+        $s.PageSize = 1000
+        [void]$s.PropertiesToLoad.AddRange([string[]]@('name', 'operatingsystem', 'lastlogontimestamp'))
+        foreach ($r in $s.FindAll()) {
+            $ll = $null
+            if ($r.Properties['lastlogontimestamp'].Count -gt 0) { $ll = [datetime]::FromFileTime([int64]$r.Properties['lastlogontimestamp'][0]) }
+            [pscustomobject]@{ Name = [string]$r.Properties['name'][0]; OS = [string]$r.Properties['operatingsystem'][0]; LastLogon = $ll }
+        }
+    } catch {
+        Say ('Could not read Active Directory: ' + $_.Exception.Message) Red
+        Say 'Run the toolkit on a domain-joined PC, signed in with a domain account.' DarkGray
+    }
+}
+
+function Select-DomainComputer {
+    Head 'Browse Domain Computers'
+    Say 'Reading Active Directory...' DarkGray
+    $all = @(Get-DomainComputers)
+    if ($all.Count -eq 0) { return }
+    $filter = "$(Read-Host 'Filter by name (Enter for all)')".Trim()
+    $shown = @($all | Where-Object { -not $filter -or $_.Name -like "*$filter*" } | Sort-Object Name | Select-Object -First 200)
+    if ($shown.Count -eq 0) { Say 'No matches.' Yellow; return }
+    $i = 0
+    foreach ($c in $shown) {
+        $i++
+        $ll = ''; if ($c.LastLogon) { $ll = $c.LastLogon.ToString('yyyy-MM-dd') }
+        Write-Host ('  [{0,3}] ' -f $i) -ForegroundColor Yellow -NoNewline
+        Write-Host ('{0,-18} {1,-32} last seen {2}' -f $c.Name, $c.OS, $ll)
+    }
+    if ($all.Count -gt 200) { Say 'Showing the first 200. Use the filter to narrow it down.' DarkGray }
+    $n = "$(Read-Host 'Number to make the target (Enter to cancel)')".Trim()
+    if ($n -match '^\d+$' -and [int]$n -ge 1 -and [int]$n -le $shown.Count) { Set-Target $shown[[int]$n - 1].Name }
+}
+
+function Get-FleetList {
+    Write-Host '  [1] ' -ForegroundColor Yellow -NoNewline; Write-Host 'All enabled computers in the domain'
+    Write-Host '  [2] ' -ForegroundColor Yellow -NoNewline; Write-Host 'Computers listed in targets.txt (one name per line)'
+    Write-Host '  [B] ' -ForegroundColor Yellow -NoNewline; Write-Host 'Cancel'
+    $c = Read-ValidKey @('1', '2', 'B')
+    if ($c -eq 'B') { return @() }
+    if ($c -eq '1') { $list = @(Get-DomainComputers | ForEach-Object { $_.Name }) }
+    else {
+        $f = Join-Path $Script:Root 'targets.txt'
+        if (-not (Test-Path $f)) {
+            Set-Content -Path $f -Value '# One computer name per line. Lines starting with # are ignored.'
+            Say ("Created {0} - add computer names, then try again." -f $f) Yellow
+            return @()
+        }
+        $list = @(Get-Content $f | Where-Object { $_ -and $_ -notmatch '^\s*#' } | ForEach-Object { $_.Trim() })
+    }
+    $list = @($list | Where-Object { $_ } | Sort-Object -Unique)
+    Say ("{0} computers in the list." -f $list.Count) Cyan
+    return $list
+}
+
+function Get-UnreachableRows {
+    param($Errors)
+    foreach ($e in @($Errors)) {
+        if (-not $e) { continue }
+        if (-not ($e.Exception -is [System.Management.Automation.Remoting.PSRemotingTransportException])) { continue }
+        $name = $e.TargetObject
+        if (-not ($name -is [string]) -or -not $name) { $name = $e.CategoryInfo.TargetName }
+        if (-not $name) { $name = $e.OriginInfo.PSComputerName }
+        [pscustomobject]@{ Computer = "$name"; Detail = (Get-RemoteErrorHint $e.Exception.Message) }
+    }
+}
+
+function Invoke-FleetStatus {
+    Head 'Fleet Status - which PCs can I reach?'
+    $list = @(Get-FleetList)
+    if ($list.Count -eq 0) { return }
+    Say 'Checking... unreachable PCs take a few seconds each to time out.' DarkGray
+    $opt = New-PSSessionOption -OpenTimeout 8000 -OperationTimeout 60000
+    $errs = $null
+    $ok = @(Invoke-Command -ComputerName $list -SessionOption $opt -ThrottleLimit $Script:ThrottleLimit -ErrorAction SilentlyContinue -ErrorVariable errs -ScriptBlock {
+        $os = Get-CimInstance Win32_OperatingSystem
+        [pscustomobject]@{ UptimeDays = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 1); User = (Get-CimInstance Win32_ComputerSystem).UserName }
+    })
+    $rows = @()
+    foreach ($r in $ok) { $rows += [pscustomobject]@{ Computer = $r.PSComputerName; Status = 'Reachable'; UptimeDays = $r.UptimeDays; User = $r.User; Detail = '' } }
+    foreach ($b in @(Get-UnreachableRows $errs)) { $rows += [pscustomobject]@{ Computer = $b.Computer; Status = 'UNREACHABLE'; UptimeDays = ''; User = ''; Detail = $b.Detail } }
+    foreach ($r in ($rows | Sort-Object Status, Computer)) {
+        $color = 'Green'; if ($r.Status -ne 'Reachable') { $color = 'Red' }
+        Write-Host ('  {0,-18} {1,-12} {2,6} {3,-25} {4}' -f $r.Computer, $r.Status, $r.UptimeDays, $r.User, $r.Detail) -ForegroundColor $color
+    }
+    $file = Join-Path $Script:FleetDir ("FleetStatus_{0:yyyy-MM-dd_HHmm}.csv" -f (Get-Date))
+    $rows | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
+    Write-Host ''
+    Say ("Reachable: {0} of {1}. Saved: {2}" -f $ok.Count, $list.Count, $file) Cyan
+    Write-Log ("Fleet status: " + $file)
+}
+
+function Invoke-FleetInventory {
+    Head 'Fleet Inventory'
+    $list = @(Get-FleetList)
+    if ($list.Count -eq 0) { return }
+    Say 'Collecting from all reachable PCs at once. This can take a few minutes.' DarkGray
+    $opt = New-PSSessionOption -OpenTimeout 8000 -OperationTimeout 180000
+    $errs = $null
+    $rows = @(Invoke-Command -ComputerName $list -ScriptBlock $Script:SB_TicketData -SessionOption $opt -ThrottleLimit $Script:ThrottleLimit -ErrorAction SilentlyContinue -ErrorVariable errs | Remove-RemoteInfo)
+    $file = Join-Path $Script:FleetDir ("Inventory_{0:yyyy-MM-dd_HHmm}.csv" -f (Get-Date))
+    $rows | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
+    Say ('  {0,-18} {1,7} {2,-7} {3,7} {4,-13} {5}' -f 'Computer', 'Uptime', 'Reboot', 'FreeGB', 'Activation', 'Needs attention') Cyan
+    foreach ($r in ($rows | Sort-Object Computer)) {
+        $flags = @()
+        $reboot = 'no'; if ("$($r.PendingReboot)" -like 'YES*') { $reboot = 'YES'; $flags += 'reboot pending' }
+        if ($r.UptimeDays -ge 14) { $flags += 'long uptime' }
+        if ($r.FreeGB_C -lt $Script:LowDiskGB) { $flags += 'low disk' }
+        if ($r.Activation -ne 'Licensed') { $flags += 'activation' }
+        $color = 'Green'; if ($flags.Count -gt 0) { $color = 'Yellow' }
+        Write-Host ('  {0,-18} {1,6}d {2,-7} {3,7} {4,-13} {5}' -f $r.Computer, $r.UptimeDays, $reboot, $r.FreeGB_C, $r.Activation, ($flags -join ', ')) -ForegroundColor $color
+    }
+    $bad = @(Get-UnreachableRows $errs)
+    foreach ($b in $bad) { Write-Host ('  {0,-18} UNREACHABLE - {1}' -f $b.Computer, $b.Detail) -ForegroundColor Red }
+    if ($bad.Count -gt 0) { $bad | Export-Csv -Path ($file -replace '\.csv$', '_unreachable.csv') -NoTypeInformation -Encoding UTF8 }
+    Write-Host ''
+    Say ("Reached {0} of {1}. Saved: {2}" -f $rows.Count, $list.Count, $file) Cyan
+    Write-Log ("Fleet inventory: " + $file)
+}
+
+function Show-RemotingHelp {
+    Head 'Remoting Setup Help'
+    Say 'Remote tools use PowerShell Remoting (WinRM, port 5985).' Cyan
+    Say 'It is ON by default on Windows Server, but OFF on Windows 10/11.' Yellow
+    Write-Host ''
+    Say 'Turn it on for domain PCs with one Group Policy object:' Gray
+    Say '  1. Computer Configuration > Policies > Administrative Templates > Windows Components' DarkGray
+    Say '     > Windows Remote Management (WinRM) > WinRM Service' DarkGray
+    Say '     > "Allow remote server management through WinRM" = Enabled' DarkGray
+    Say '     (IPv4/IPv6 filter: your admin subnet, or * for a lab)' DarkGray
+    Say '  2. Computer Configuration > Policies > Windows Settings > Security Settings > System Services' DarkGray
+    Say '     > "Windows Remote Management (WS-Management)" = Automatic' DarkGray
+    Say '  3. Windows Defender Firewall inbound rule: predefined "Windows Remote Management", Domain profile' DarkGray
+    Write-Host ''
+    Say 'Also needed:' Gray
+    Say '  - Your account must be a local admin on the target PCs.' DarkGray
+    Say '  - Run the toolkit on a domain-joined PC. Use computer names, not IP addresses.' DarkGray
+    Say '  - Laptops off the network (home, no VPN) cannot be reached this way. Use Cloud (Intune).' DarkGray
+    Write-Host ''
+    if ($Script:IsLocal -and (Read-YesNo 'Enable remoting on THIS PC now? (useful for a test lab)' 'N' 20)) {
+        if ($Script:DryRun) { Say '[DRY RUN] Would run Enable-PSRemoting -Force' Yellow; return }
+        try { Enable-PSRemoting -Force -ErrorAction Stop; Say 'Remoting enabled on this PC.' Green; Write-Log 'Enable-PSRemoting ran on this PC' }
+        catch { Say ('Failed: ' + $_.Exception.Message) Red; Say 'If the network is set to Public, change it to Private or Domain first.' DarkGray }
+    }
+}
+
+# ==================================================================
+#  CLOUD (Intune + Entra via Microsoft Graph)
+# ==================================================================
+function Connect-Cloud {
+    if ($Script:GraphConnected) { return $true }
+    $need = @('Microsoft.Graph.Authentication', 'Microsoft.Graph.DeviceManagement', 'Microsoft.Graph.Identity.SignIns')
+    $missing = @($need | Where-Object { -not (Get-Module -ListAvailable -Name $_) })
+    if ($missing.Count -gt 0) {
+        Say ('Missing PowerShell modules: ' + ($missing -join ', ')) Yellow
+        if (-not (Read-YesNo 'Install them now from the PowerShell Gallery (current user)?' 'N' 30)) { return $false }
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue)) {
+                Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+            }
+            Say 'Installing, this can take a few minutes...' DarkGray
+            Install-Module -Name $missing -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+        } catch { Say ('Install failed: ' + $_.Exception.Message) Red; return $false }
+    }
+    Say 'A Microsoft sign-in window opens. Sign in with your admin account.' Cyan
+    try {
+        Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+        Connect-MgGraph -Scopes 'DeviceManagementManagedDevices.Read.All', 'DeviceManagementManagedDevices.PrivilegedOperations.All', 'BitlockerKey.Read.All' -ErrorAction Stop | Out-Null
+        $ctx = Get-MgContext
+        $Script:GraphConnected = $true
+        Say ("Connected as {0}." -f $ctx.Account) Green
+        Write-Log ("Graph connected: " + $ctx.Account)
+        return $true
+    } catch { Say ('Sign-in failed: ' + $_.Exception.Message) Red; return $false }
+}
+
+function Get-CloudDevices {
+    Get-MgDeviceManagementManagedDevice -All -ErrorAction Stop -Property 'id', 'deviceName', 'userPrincipalName', 'operatingSystem', 'osVersion', 'complianceState', 'lastSyncDateTime', 'azureADDeviceId', 'model', 'serialNumber'
+}
+
+function Show-CloudDevices {
+    Head 'Intune Devices'
+    if (-not (Connect-Cloud)) { return }
+    Say 'Loading devices...' DarkGray
+    $Script:CloudCache = @(Get-CloudDevices)
+    $file = Join-Path $Script:FleetDir ("Intune_Devices_{0:yyyy-MM-dd_HHmm}.csv" -f (Get-Date))
+    $Script:CloudCache | Select-Object DeviceName, UserPrincipalName, OperatingSystem, OsVersion, ComplianceState, LastSyncDateTime, Model, SerialNumber, AzureAdDeviceId, Id |
+        Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
+    foreach ($d in ($Script:CloudCache | Sort-Object DeviceName)) {
+        $days = 999; if ($d.LastSyncDateTime) { $days = [int]((Get-Date) - $d.LastSyncDateTime).TotalDays }
+        $color = 'Gray'
+        if ($days -gt 7) { $color = 'Yellow' }
+        if ("$($d.ComplianceState)" -eq 'noncompliant') { $color = 'Red' }
+        Write-Host ('  {0,-20} {1,-30} {2,-13} synced {3,3}d ago' -f $d.DeviceName, $d.UserPrincipalName, $d.ComplianceState, $days) -ForegroundColor $color
+    }
+    Write-Host ''
+    Say ("{0} devices. Red = noncompliant, Yellow = no sync in 7+ days." -f $Script:CloudCache.Count) Cyan
+    Say ("Saved: " + $file) Green
+    Write-Log ("Intune device list: " + $file)
+}
+
+function Select-CloudDevice {
+    if (-not (Connect-Cloud)) { return $null }
+    if (-not $Script:CloudCache) { Say 'Loading Intune devices...' DarkGray; $Script:CloudCache = @(Get-CloudDevices) }
+    $q = "$(Read-Host 'Device name (or part of it)')".Trim()
+    if (-not $q) { return $null }
+    $m = @($Script:CloudCache | Where-Object { $_.DeviceName -like "*$q*" } | Sort-Object DeviceName | Select-Object -First 50)
+    if ($m.Count -eq 0) { Say 'No matching devices.' Yellow; return $null }
+    $i = 0
+    foreach ($d in $m) { $i++; Write-Host ('  [{0,2}] ' -f $i) -ForegroundColor Yellow -NoNewline; Write-Host ('{0,-20} {1,-30} {2}' -f $d.DeviceName, $d.UserPrincipalName, $d.ComplianceState) }
+    if ($m.Count -eq 1) { return $m[0] }
+    $n = "$(Read-Host 'Number')".Trim()
+    if ($n -match '^\d+$' -and [int]$n -ge 1 -and [int]$n -le $m.Count) { return $m[[int]$n - 1] }
+    return $null
+}
+
+function Show-CloudDevice {
+    Head 'Find an Intune Device'
+    $d = Select-CloudDevice
+    if (-not $d) { return }
+    $d | Select-Object DeviceName, UserPrincipalName, OperatingSystem, OsVersion, ComplianceState, LastSyncDateTime, Model, SerialNumber, AzureAdDeviceId, Id | Format-List | Out-Both
+}
+
+function Sync-CloudDevice {
+    Head 'Sync an Intune Device'
+    $d = Select-CloudDevice
+    if (-not $d) { return }
+    if (-not (Read-YesNo ("Send a sync request to {0}?" -f $d.DeviceName) 'N' 20)) { Say 'Cancelled.' Green; return }
+    if ($Script:DryRun) { Say ("[DRY RUN] Would sync " + $d.DeviceName) Yellow; return }
+    Sync-MgDeviceManagementManagedDevice -ManagedDeviceId $d.Id -ErrorAction Stop
+    Say 'Sync request sent. The device checks in next time it is online, usually within minutes.' Green
+    Write-Log ("Intune sync sent: " + $d.DeviceName)
+}
+
+function Show-CloudBitLocker {
+    Head 'BitLocker Keys from Entra ID'
+    $d = Select-CloudDevice
+    if (-not $d) { return }
+    if (-not $d.AzureAdDeviceId) { Say 'This device has no Entra device ID.' Yellow; return }
+    Show-SecretBanner
+    $keys = @(Get-MgInformationProtectionBitlockerRecoveryKey -Filter ("deviceId eq '{0}'" -f $d.AzureAdDeviceId) -All -ErrorAction Stop)
+    if ($keys.Count -eq 0) { Say 'No recovery keys are stored in Entra for this device.' Yellow; return }
+    foreach ($k in $keys) {
+        $full = Get-MgInformationProtectionBitlockerRecoveryKey -BitlockerRecoveryKeyId $k.Id -Property 'key' -ErrorAction Stop
+        $line = "Device: {0}  Created: {1}  Key ID: {2}`r`n  RECOVERY KEY: {3}" -f $d.DeviceName, $k.CreatedDateTime, $k.Id, $full.Key
+        Write-Host $line -ForegroundColor White
+        if ($Script:LogSecrets) { Write-Log $line }
+    }
+    Say 'Note: each key you view is recorded in the Entra audit log. That is normal.' DarkGray
+}
+
+function Disconnect-Cloud {
+    Head 'Disconnect from Microsoft Graph'
+    if ($Script:GraphConnected) { try { Disconnect-MgGraph | Out-Null } catch {} }
+    $Script:GraphConnected = $false; $Script:CloudCache = $null
+    Say 'Disconnected.' Green
+}
+
+# ==================================================================
+#  PLUGINS
+# ==================================================================
+function Show-Plugins {
+    Head 'Plugins'
+    $files = @(Get-ChildItem -Path $Script:PluginDir -Filter *.ps1 -ErrorAction SilentlyContinue | Sort-Object Name)
+    if ($files.Count -eq 0) { Say ("No plugins yet. Drop .ps1 files into: " + $Script:PluginDir) Yellow; return }
+    $i = 0
+    foreach ($f in $files) { $i++; Write-Host ('  [{0}] ' -f $i) -ForegroundColor Yellow -NoNewline; Write-Host $f.BaseName }
+    $n = "$(Read-Host 'Number to run (Enter to cancel)')".Trim()
+    if (-not ($n -match '^\d+$' -and [int]$n -ge 1 -and [int]$n -le $files.Count)) { return }
+    $f = $files[[int]$n - 1]
+    Say 'Plugins can change anything. Only run plugins you trust.' Yellow
+    if (-not (Read-YesNo ("Run '{0}' on {1}?" -f $f.BaseName, $Script:Target) 'N' 20)) { Say 'Cancelled.' Green; return }
+    if ($Script:DryRun) { Say ("[DRY RUN] Would run plugin {0} on {1}" -f $f.Name, $Script:Target) Yellow; return }
+    Write-LogHeader ("Plugin: " + $f.BaseName)
+    if ($Script:IsLocal) { & $f.FullName | Out-Both }
+    else { Invoke-Command -ComputerName $Script:Target -FilePath $f.FullName -ErrorAction Stop | Remove-RemoteInfo | Out-Both }
+}
+
+# ==================================================================
+#  MENUS
+# ==================================================================
+function Show-Header {
+    Clear-Host
+    Say ('=' * 62) Cyan
+    Say ("          IT ADMINISTRATION REPAIR TOOLKIT  v{0}" -f $Script:Version) Cyan
+    Say ('=' * 62) Cyan
+    Write-Host ' Target: ' -ForegroundColor DarkGray -NoNewline
+    if ($Script:IsLocal) { Write-Host ("{0} (this PC)" -f $Script:Target) -ForegroundColor Green -NoNewline }
+    else { Write-Host ("{0} (REMOTE)" -f $Script:Target) -ForegroundColor Magenta -NoNewline }
+    if ($Script:DryRun) { Write-Host '    DRY RUN: ON' -ForegroundColor Yellow } else { Write-Host '' }
+    $h = $Script:HeaderInfo
+    if ($h) {
+        Write-Host (' OS: ' + $h.OS) -ForegroundColor DarkGray
+        $upColor = 'Green'; if ($h.UptimeDays -ge 14) { $upColor = 'Red' }
+        $prColor = 'Green'; $prText = 'No'; if ($h.PendingReboot) { $prColor = 'Red'; $prText = 'YES' }
+        $dkColor = 'Green'; if ($h.FreeGB -lt $Script:LowDiskGB) { $dkColor = 'Red' }
+        Write-Host ' Uptime: ' -ForegroundColor DarkGray -NoNewline; Write-Host ("{0} days" -f $h.UptimeDays) -ForegroundColor $upColor -NoNewline
+        Write-Host '   Pending reboot: ' -ForegroundColor DarkGray -NoNewline; Write-Host $prText -ForegroundColor $prColor -NoNewline
+        Write-Host '   Free C: ' -ForegroundColor DarkGray -NoNewline; Write-Host ("{0} GB" -f $h.FreeGB) -ForegroundColor $dkColor
+    } else { Say ' (target info unavailable)' DarkGray }
+    Say ('=' * 62) Cyan
+}
+
+function Show-Menu {
+    param([string]$Title, [array]$Items)
+    while ($true) {
+        Show-Header
+        Say ('  ' + $Title) Cyan
+        Say ('-' * 62) DarkCyan
+        foreach ($i in $Items) {
+            $label = $i.Label
+            $color = 'Gray'
+            if ($i.Danger) { $color = 'Red' }
+            if ($i.LocalOnly -and -not $Script:IsLocal) { $color = 'DarkGray'; $label += ' (local only)' }
+            Write-Host ('  [{0,2}] ' -f $i.Key) -ForegroundColor Yellow -NoNewline
+            Write-Host $label -ForegroundColor $color
+        }
+        Say ('-' * 62) DarkCyan
+        Write-Host '  [B] Back    [L] Open Logs    [Q] Exit' -ForegroundColor Yellow
+        $sel = "$(Read-Host "`nSelect")".Trim().ToUpper()
+        if (-not $sel) { continue }
+        if ($sel -eq 'B') { return }
+        if ($sel -eq 'L') { Open-Logs; continue }
+        if ($sel -eq 'Q') { if (Confirm-Exit) { Exit-Toolkit }; continue }
+        $item = $Items | Where-Object { $_.Key -eq $sel } | Select-Object -First 1
+        if (-not $item) { Say 'Invalid choice.' Red; Start-Sleep -Seconds 1; continue }
+        if ($item.LocalOnly -and -not $Script:IsLocal) { Say 'This tool only works on this PC. Change the target to THIS PC first.' Red; Start-Sleep -Seconds 2; continue }
+        try { & $item.Action }
+        catch {
+            Say ('ERROR: ' + $_.Exception.Message) Red
+            Write-Log ('ERROR: ' + $_.Exception.Message)
+            if (-not $Script:IsLocal) { Say ('Hint: ' + (Get-RemoteErrorHint $_.Exception.Message)) DarkGray }
+        }
+        if ((Show-Nav) -eq 'M') { return }
+    }
+}
+
+$Script:MenuDiagnose = @(
+    @{ Key = '1';  Label = 'Ticket Summary (copies to clipboard)';          Action = { Show-TicketSummary } }
+    @{ Key = '2';  Label = 'System Info';                                   Action = { Show-Simple 'System Info' { systeminfo.exe } } }
+    @{ Key = '3';  Label = 'Drive Health';                                  Action = { Show-DriveHealth } }
+    @{ Key = '4';  Label = 'Pending Reboot Check';                          Action = { Show-PendingReboot } }
+    @{ Key = '5';  Label = 'Last 20 System Errors';                         Action = { Show-EventErrors } }
+    @{ Key = '6';  Label = 'Problem Devices (yellow ! in Device Manager)';  Action = { Show-ProblemDevices } }
+    @{ Key = '7';  Label = 'Crash History (blue screens)';                  Action = { Show-Crashes } }
+    @{ Key = '8';  Label = 'BitLocker Status';                              Action = { Show-Simple 'BitLocker Status' { manage-bde.exe -status } } }
+    @{ Key = '9';  Label = 'Windows Activation Status';                     Action = { Show-Simple 'Activation Status' { cscript.exe //nologo "$env:SystemRoot\System32\slmgr.vbs" /dli } } }
+    @{ Key = '10'; Label = 'Domain / Entra Join Status';                    Action = { Show-JoinStatus } }
+    @{ Key = '11'; Label = 'Windows 11 Readiness';                          Action = { Show-Win11Readiness } }
+    @{ Key = '12'; Label = 'Startup Programs';                              Action = { Show-Simple 'Startup Programs' { Get-CimInstance Win32_StartupCommand | Select-Object Name, Command, Location, User } -Table } }
+    @{ Key = '13'; Label = 'Time Sync Status';                              Action = { Show-Simple 'Time Sync Status' { w32tm.exe /query /status } } }
+)
+
+$Script:MenuRepair = @(
+    @{ Key = '1';  Label = 'Quick Repair - checks first, then DISM + SFC';  Action = { Invoke-QuickRepair } }
+    @{ Key = '2';  Label = 'SFC Scan';                                      Action = { Invoke-SfcScan } }
+    @{ Key = '3';  Label = 'SFC Verify Only';                               Action = { Invoke-SfcVerify } }
+    @{ Key = '4';  Label = 'DISM Scan Health';                              Action = { Invoke-Dism 'ScanHealth' } }
+    @{ Key = '5';  Label = 'DISM Restore Health';                           Action = { Invoke-Dism 'RestoreHealth' } }
+    @{ Key = '6';  Label = 'Component Store Cleanup';                       Action = { Invoke-Dism 'StartComponentCleanup' } }
+    @{ Key = '7';  Label = 'Windows Update Reset';                          Action = { Reset-WindowsUpdate } }
+    @{ Key = '8';  Label = 'Group Policy Refresh + Report';                 Action = { Invoke-GPRefresh } }
+    @{ Key = '9';  Label = 'Time Resync';                                   Action = { Invoke-TimeResync } }
+    @{ Key = '10'; Label = 'Defender: Update + Quick Scan';                 Action = { Invoke-DefenderScan 'Quick' } }
+    @{ Key = '11'; Label = 'Defender: Full Scan (slow)';                    Action = { Invoke-DefenderScan 'Full' } }
+    @{ Key = '12'; Label = 'Schedule CHKDSK Repair (next restart)';         Action = { Invoke-ChkdskSchedule } }
+)
+
+$Script:MenuNetwork = @(
+    @{ Key = '1'; Label = 'Network Quick Test';                             Action = { Invoke-NetTest } }
+    @{ Key = '2'; Label = 'IP Configuration (ipconfig /all)';               Action = { Show-Simple 'IP Configuration' { ipconfig.exe /all } } }
+    @{ Key = '3'; Label = 'Flush DNS';                                      Action = { Invoke-FlushDns } }
+    @{ Key = '4'; Label = 'System Proxy Check / Reset';                     Action = { Invoke-ProxyCheck } }
+    @{ Key = '5'; Label = 'Hosts File Check (+ backup)';                    Action = { Show-HostsFile } }
+    @{ Key = '6'; Label = 'Reset Winsock (restart)';                        Action = { Reset-Winsock } }
+    @{ Key = '7'; Label = 'Reset TCP/IP (restart)';                         Action = { Reset-TcpIp }; Danger = $true }
+    @{ Key = '8'; Label = 'Wi-Fi Report';                                   Action = { Show-WlanReport }; LocalOnly = $true }
+)
+
+$Script:MenuApps = @(
+    @{ Key = '1'; Label = 'Print Spooler Reset (clear stuck jobs)';         Action = { Reset-PrintSpooler } }
+    @{ Key = '2'; Label = 'Printers and Queues';                            Action = { Show-Printers } }
+    @{ Key = '3'; Label = 'Teams Cache Clear';                              Action = { Clear-TeamsCache } }
+    @{ Key = '4'; Label = 'Microsoft Store Reset';                          Action = { Reset-Store }; LocalOnly = $true }
+    @{ Key = '5'; Label = 'WinGet Repair';                                  Action = { Repair-WinGet }; LocalOnly = $true }
+    @{ Key = '6'; Label = 'Control Panels Launcher';                        Action = { Show-Panels } }
+    @{ Key = '7'; Label = 'Quick Assist (remote help)';                     Action = { Start-QuickAssist }; LocalOnly = $true }
+)
+
+$Script:MenuReports = @(
+    @{ Key = '1'; Label = 'Full Report';                                    Action = { New-FullReport } }
+    @{ Key = '2'; Label = 'Installed Software (CSV)';                       Action = { Export-Software } }
+    @{ Key = '3'; Label = 'Drivers (CSV)';                                  Action = { Export-Drivers } }
+    @{ Key = '4'; Label = 'Battery Report';                                 Action = { New-PowerReport 'battery' } }
+    @{ Key = '5'; Label = 'Energy Report';                                  Action = { New-PowerReport 'energy' } }
+)
+
+$Script:MenuPower = @(
+    @{ Key = '1'; Label = 'WinRE Info';                                     Action = { Show-Simple 'WinRE Info' { reagentc.exe /info } } }
+    @{ Key = '2'; Label = 'Restart PC';                                     Action = { Restart-TargetPC }; Danger = $true }
+    @{ Key = '3'; Label = 'Advanced Startup (restarts now)';                Action = { Start-AdvancedStartup }; Danger = $true; LocalOnly = $true }
+    @{ Key = '4'; Label = 'System Restore';                                 Action = { Start-LocalTool 'System Restore' 'rstrui.exe' }; LocalOnly = $true }
+    @{ Key = '5'; Label = 'Memory Diagnostic';                              Action = { Start-LocalTool 'Memory Diagnostic' 'mdsched.exe' -Note 'Windows asks whether to restart now or later.' }; LocalOnly = $true }
+    @{ Key = '6'; Label = 'Windows Update Settings';                        Action = { Start-LocalTool 'Windows Update' 'ms-settings:windowsupdate' -Note 'Click "Check for updates".' }; LocalOnly = $true }
+    @{ Key = '7'; Label = 'Disk Cleanup';                                   Action = { Start-LocalTool 'Disk Cleanup' 'cleanmgr.exe' }; LocalOnly = $true }
+)
+
+$Script:MenuSecrets = @(
+    @{ Key = '1'; Label = 'BitLocker Recovery Keys';                        Action = { Show-BitLockerKeys } }
+    @{ Key = '2'; Label = 'Saved Wi-Fi Passwords';                          Action = { Show-WifiPasswords } }
+)
+
+$Script:MenuFleet = @(
+    @{ Key = '1'; Label = 'Set Target by Name';                             Action = { Head 'Set Target'; Set-Target (Read-Host 'Computer name') } }
+    @{ Key = '2'; Label = 'Browse Domain Computers';                        Action = { Select-DomainComputer } }
+    @{ Key = '3'; Label = 'Switch Back to This PC';                         Action = { Head 'Set Target'; Set-Target $env:COMPUTERNAME } }
+    @{ Key = '4'; Label = 'Fleet Status - who can I reach?';                Action = { Invoke-FleetStatus } }
+    @{ Key = '5'; Label = 'Fleet Inventory (CSV of every PC)';              Action = { Invoke-FleetInventory } }
+    @{ Key = '6'; Label = 'Remoting Setup Help';                            Action = { Show-RemotingHelp } }
+)
+
+$Script:MenuCloud = @(
+    @{ Key = '1'; Label = 'Connect to Microsoft Graph';                     Action = { Head 'Connect'; [void](Connect-Cloud) } }
+    @{ Key = '2'; Label = 'List Intune Devices (CSV)';                      Action = { Show-CloudDevices } }
+    @{ Key = '3'; Label = 'Find a Device';                                  Action = { Show-CloudDevice } }
+    @{ Key = '4'; Label = 'Sync a Device';                                  Action = { Sync-CloudDevice } }
+    @{ Key = '5'; Label = 'BitLocker Keys from Entra';                      Action = { Show-CloudBitLocker } }
+    @{ Key = '6'; Label = 'Disconnect';                                     Action = { Disconnect-Cloud } }
+)
+
+function Invoke-MainAction {
+    param([scriptblock]$Action)
+    try { & $Action } catch { Say ('ERROR: ' + $_.Exception.Message) Red; Write-Log ('ERROR: ' + $_.Exception.Message) }
+    [void](Show-Nav)
+}
+
+function Show-TargetMenu {
+    Head 'Change Target'
+    Write-Host '  [1] ' -ForegroundColor Yellow -NoNewline; Write-Host 'This PC'
+    Write-Host '  [2] ' -ForegroundColor Yellow -NoNewline; Write-Host 'Type a computer name'
+    Write-Host '  [3] ' -ForegroundColor Yellow -NoNewline; Write-Host 'Browse domain computers'
+    Write-Host '  [B] ' -ForegroundColor Yellow -NoNewline; Write-Host 'Back'
+    $k = Read-ValidKey @('1', '2', '3', 'B')
+    if ($k -eq '1') { Set-Target $env:COMPUTERNAME }
+    if ($k -eq '2') { Set-Target (Read-Host 'Computer name') }
+    if ($k -eq '3') { Select-DomainComputer }
+}
+
+function Test-ToolkitUpdate {
+    if (-not $Script:UpdateUrl) { return }
+    try {
+        $latest = (Invoke-WebRequest -Uri $Script:UpdateUrl -UseBasicParsing -TimeoutSec 5).Content.Trim()
+        if ([version]$latest -gt [version]$Script:Version) { $Script:UpdateNotice = "Update available: v$latest (you have v$($Script:Version))" }
+    } catch {}
+}
+
+function Show-MainMenu {
+    while ($true) {
+        Update-HeaderInfo
+        Show-Header
+        if ($Script:UpdateNotice) { Say (' ' + $Script:UpdateNotice) Yellow }
+        Write-Host ''
+        Write-Host '  [S] Ticket Summary  ' -ForegroundColor Green -NoNewline; Write-Host '<- start here for most tickets' -ForegroundColor DarkGray
+        Write-Host ''
+        $rows = @(
+            @('1', 'Diagnose', '6', 'Power & Boot'),
+            @('2', 'Repair', '7', 'Secrets (keys & passwords)'),
+            @('3', 'Network', '8', 'Remote & Fleet (domain)'),
+            @('4', 'Printing & Apps', '9', 'Cloud (Intune)'),
+            @('5', 'Reports & Exports', 'P', 'Plugins')
+        )
+        foreach ($r in $rows) {
+            Write-Host ('  [{0}] ' -f $r[0]) -ForegroundColor Yellow -NoNewline; Write-Host ('{0,-22}' -f $r[1]) -NoNewline
+            Write-Host ('[{0}] ' -f $r[2]) -ForegroundColor Yellow -NoNewline; Write-Host $r[3]
+        }
+        Say ('-' * 62) DarkCyan
+        Write-Host '  [T] Change Target   [D] Dry Run on/off   [L] Logs   [Q] Exit' -ForegroundColor Yellow
+        Say ('=' * 62) Cyan
+        $sel = "$(Read-Host 'Select')".Trim().ToUpper()
+        if     ($sel -eq 'S') { Invoke-MainAction { Show-TicketSummary } }
+        elseif ($sel -eq '1') { Show-Menu 'DIAGNOSE' $Script:MenuDiagnose }
+        elseif ($sel -eq '2') { Show-Menu 'REPAIR' $Script:MenuRepair }
+        elseif ($sel -eq '3') { Show-Menu 'NETWORK' $Script:MenuNetwork }
+        elseif ($sel -eq '4') { Show-Menu 'PRINTING & APPS' $Script:MenuApps }
+        elseif ($sel -eq '5') { Show-Menu 'REPORTS & EXPORTS' $Script:MenuReports }
+        elseif ($sel -eq '6') { Show-Menu 'POWER & BOOT' $Script:MenuPower }
+        elseif ($sel -eq '7') { Show-Menu 'SECRETS' $Script:MenuSecrets }
+        elseif ($sel -eq '8') { Show-Menu 'REMOTE & FLEET' $Script:MenuFleet }
+        elseif ($sel -eq '9') { Show-Menu 'CLOUD (INTUNE)' $Script:MenuCloud }
+        elseif ($sel -eq 'P') { Invoke-MainAction { Show-Plugins } }
+        elseif ($sel -eq 'T') { Show-TargetMenu; Start-Sleep -Seconds 2 }
+        elseif ($sel -eq 'D') { $Script:DryRun = -not $Script:DryRun; Write-Log ("Dry Run set to " + $Script:DryRun) }
+        elseif ($sel -eq 'L') { Open-Logs }
+        elseif ($sel -eq 'Q') { if (Confirm-Exit) { Exit-Toolkit } }
+        elseif ($sel) { Say 'Invalid choice.' Red; Start-Sleep -Seconds 1 }
+    }
+}
+
+# ==================================================================
+#  START
+# ==================================================================
+Write-Log ''
+Write-Log ("##### Toolkit v{0} started by {1} on {2} at {3:yyyy-MM-dd HH:mm:ss} #####" -f $Script:Version, $env:USERNAME, $env:COMPUTERNAME, (Get-Date))
+Write-Host 'Loading...' -ForegroundColor DarkGray
+Test-ToolkitUpdate
+Show-MainMenu
